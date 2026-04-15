@@ -1,0 +1,5 @@
+package com.example.write_log
+
+import io.flutter.embedding.android.FlutterActivity
+
+class MainActivity : FlutterActivity()
