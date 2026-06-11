@@ -1,0 +1,191 @@
+## So sánh RepaintBoundary vs Tách Widget (Rebuild Boundary)
+
+Hai kỹ thuật này giải quyết **hai giai đoạn khác nhau** trong rendering pipeline của Flutter, nên cần hiểu rõ pipeline trước.
+
+## Flutter Rendering Pipeline
+
+```
+setState() → Build (Widget tree) → Layout → Paint → Composite
+              ↑                              ↑
+        Tách widget                   RepaintBoundary
+      giới hạn rebuild              giới hạn repaint
+```
+
+Tách widget tác động ở giai đoạn **Build**, còn RepaintBoundary tác động ở giai đoạn **Paint**. Đây là hai vấn đề khác nhau hoàn toàn.
+
+---
+
+## 1. Tách Widget — Rebuild Boundary
+
+**Vấn đề nó giải quyết:** Khi `setState()` được gọi, Flutter rebuild toàn bộ subtree của widget đó. Nếu widget quá lớn, nhiều child không liên quan cũng bị rebuild lãng phí.
+
+**Cơ chế hoạt động:**
+
+```dart
+// ❌ Không tách — toàn bộ build() chạy lại khi counter thay đổi
+class BigWidget extends StatefulWidget {
+  @override
+  _BigWidgetState createState() => _BigWidgetState();
+}
+
+class _BigWidgetState extends State<BigWidget> {
+  int counter = 0;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: [
+        Text('$counter'),               // cần rebuild
+        ExpensiveChart(),                // bị rebuild vô ích
+        ComplexList(items: staticData),  // bị rebuild vô ích
+      ],
+    );
+  }
+}
+```
+
+```dart
+// ✅ Tách widget — chỉ CounterText rebuild
+class ParentWidget extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: [
+        CounterText(),                   // rebuild riêng
+        ExpensiveChart(),                // không bị rebuild
+        ComplexList(items: staticData),  // không bị rebuild
+      ],
+    );
+  }
+}
+
+class CounterText extends StatefulWidget {
+  @override
+  _CounterTextState createState() => _CounterTextState();
+}
+
+class _CounterTextState extends State<CounterText> {
+  int counter = 0;
+
+  @override
+  Widget build(BuildContext context) {
+    return Text('$counter'); // chỉ rebuild mình nó
+  }
+}
+```
+
+**Tại sao hiệu quả:** Flutter so sánh widget tree cũ và mới bằng `canUpdate()` (check `runtimeType` + `key`). Khi `ExpensiveChart` là child của `ParentWidget` (StatelessWidget không setState), nó giữ nguyên instance → Flutter skip rebuild cho nó.
+
+---
+
+## 2. RepaintBoundary — Paint Boundary
+
+**Vấn đề nó giải quyết:** Sau khi build và layout xong, Flutter paint các RenderObject lên canvas. Mặc định, khi một RenderObject cần repaint, **parent** của nó cũng bị repaint (vì chúng chia sẻ cùng một layer). RepaintBoundary tạo một layer riêng, cô lập vùng repaint.
+
+**Cơ chế hoạt động:**
+
+```dart
+// ❌ Không có RepaintBoundary
+// Khi animation chạy, toàn bộ parent layer bị repaint
+class MyScreen extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return Stack(
+      children: [
+        VeryComplexBackground(),   // bị repaint mỗi frame
+        AnimatedProgressBar(),     // animation trigger repaint
+      ],
+    );
+  }
+}
+```
+
+```dart
+// ✅ Có RepaintBoundary
+// Animation chỉ repaint layer riêng của nó
+class MyScreen extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return Stack(
+      children: [
+        VeryComplexBackground(),          // không bị repaint
+        RepaintBoundary(
+          child: AnimatedProgressBar(),   // repaint trong layer riêng
+        ),
+      ],
+    );
+  }
+}
+```
+
+**Tại sao hiệu quả:** GPU cache lại layer đã paint. Khi chỉ một layer thay đổi, compositor ghép layer cũ (cached) với layer mới, không cần paint lại toàn bộ.
+
+---
+
+## So sánh chi tiết
+
+| Tiêu chí | Tách Widget | RepaintBoundary |
+|---|---|---|
+| **Giai đoạn tác động** | Build phase | Paint phase |
+| **Giải quyết vấn đề** | Widget tree rebuild không cần thiết | Pixel paint lại không cần thiết |
+| **Chi phí** | Gần như zero — chỉ thêm class | Tốn thêm memory cho mỗi layer riêng |
+| **Khi nào có hiệu quả** | Widget phức tạp có phần thay đổi thường xuyên và phần tĩnh | Animation, scroll, hoặc bất kỳ thứ gì repaint liên tục (mỗi frame) |
+| **Khi nào không hiệu quả** | State đã được quản lý tốt, widget đã nhỏ | Widget đơn giản, paint rẻ; hoặc thêm quá nhiều layer gây overhead compositor |
+| **Debug tool** | Flutter DevTools → Widget Rebuild Tracker | Flutter DevTools → `debugRepaintRainbowEnabled = true` |
+| **Tự động được Flutter áp dụng** | Không | Có, ở một số widget: ListView item, Navigator route, TextField cursor... |
+
+---
+
+## Ví dụ thực tế kết hợp cả hai
+
+```dart
+class ChatScreen extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: [
+        // Tách widget: header không rebuild khi có message mới
+        ChatHeader(),
+
+        // RepaintBoundary: list scroll liên tục, 
+        // không cần repaint header và input
+        Expanded(
+          child: RepaintBoundary(
+            child: ChatMessageList(), // scroll → repaint mỗi frame
+          ),
+        ),
+
+        // Tách widget: input có state riêng (typing),
+        // không rebuild toàn bộ screen
+        RepaintBoundary(
+          child: ChatInputBar(), // cursor blink → repaint mỗi 500ms
+        ),
+      ],
+    );
+  }
+}
+
+// ChatMessageList cũng tách widget bên trong
+class ChatMessageList extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return ListView.builder(
+      // ListView tự thêm RepaintBoundary cho mỗi item
+      itemBuilder: (context, index) {
+        // Tách widget: mỗi message rebuild độc lập
+        return ChatBubble(message: messages[index]);
+      },
+    );
+  }
+}
+```
+
+---
+
+## Khi nào dùng cái nào
+
+**Dùng tách widget khi:** bạn thấy trong DevTools có widget rebuild mà data của nó không thay đổi. Đây là dấu hiệu widget đó bị cuốn vào `setState` của parent. Tách nó ra thành widget riêng với state riêng.
+
+**Dùng RepaintBoundary khi:** bạn bật `debugRepaintRainbowEnabled = true` và thấy vùng lớn đổi màu liên tục, trong khi chỉ một phần nhỏ thực sự thay đổi (animation, scroll, cursor blink). Wrap phần thay đổi đó trong RepaintBoundary.
+
+**Dùng cả hai khi:** widget vừa gây rebuild vô ích cho neighbor, vừa gây repaint liên tục lên parent layer — ví dụ điển hình là animation widget nằm trong một màn hình phức tạp.
